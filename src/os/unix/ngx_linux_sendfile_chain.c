@@ -292,6 +292,19 @@ eintr:
         }
     }
 
+    if (n == 0) {
+        /*
+         * if sendfile returns zero, then someone has truncated the file,
+         * so the offset became beyond the end of the file
+         */
+
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "sendfile() reported that \"%s\" was truncated at %O",
+                      file->file->name.data, file->file_pos);
+
+        return NGX_ERROR;
+    }
+
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0, "sendfile: %z of %uz @%O",
                    n, size, file->file_pos);
 
@@ -343,15 +356,44 @@ ngx_linux_sendfile_thread(ngx_connection_t *c, ngx_buf_t *file, size_t size,
     if (task->event.complete) {
         task->event.complete = 0;
 
-        if (ctx->err && ctx->err != NGX_EAGAIN) {
+        if (ctx->err == NGX_EAGAIN) {
+            *sent = 0;
+            return NGX_AGAIN;
+        }
+
+        if (ctx->err) {
             wev->error = 1;
             ngx_connection_error(c, ctx->err, "sendfile() failed");
+            return NGX_ERROR;
+        }
+
+        if (ctx->sent == 0) {
+            /*
+             * if sendfile returns zero, then someone has truncated the file,
+             * so the offset became beyond the end of the file
+             */
+
+            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                          "sendfile() reported that \"%s\" was truncated at %O",
+                          file->file->name.data, file->file_pos);
+
             return NGX_ERROR;
         }
 
         *sent = ctx->sent;
 
         return (ctx->sent == ctx->size) ? NGX_DONE : NGX_AGAIN;
+    }
+
+    if (task->event.active && ctx->file == file) {
+        /*
+         * tolerate duplicate calls; they can happen due to subrequests
+         * or multiple calls of the next body filter from a filter
+         */
+
+        *sent = 0;
+
+        return NGX_OK;
     }
 
     ctx->file = file;
