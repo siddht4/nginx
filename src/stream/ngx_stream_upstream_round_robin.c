@@ -10,12 +10,14 @@
 #include <ngx_stream.h>
 
 
-#define ngx_stream_upstream_tries(p) ((p)->number                             \
-                                      + ((p)->next ? (p)->next->number : 0))
+#define ngx_stream_upstream_tries(p) ((p)->tries                              \
+                                      + ((p)->next ? (p)->next->tries : 0))
 
 
 static ngx_stream_upstream_rr_peer_t *ngx_stream_upstream_get_peer(
     ngx_stream_upstream_rr_peer_data_t *rrp);
+static void ngx_stream_upstream_notify_round_robin_peer(
+    ngx_peer_connection_t *pc, void *data, ngx_uint_t state);
 
 #if (NGX_STREAM_SSL)
 
@@ -23,6 +25,10 @@ static ngx_int_t ngx_stream_upstream_set_round_robin_peer_session(
     ngx_peer_connection_t *pc, void *data);
 static void ngx_stream_upstream_save_round_robin_peer_session(
     ngx_peer_connection_t *pc, void *data);
+static ngx_int_t ngx_stream_upstream_empty_set_session(
+    ngx_peer_connection_t *pc, void *data);
+static void ngx_stream_upstream_empty_save_session(ngx_peer_connection_t *pc,
+    void *data);
 
 #endif
 
@@ -32,7 +38,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
     ngx_stream_upstream_srv_conf_t *us)
 {
     ngx_url_t                        u;
-    ngx_uint_t                       i, j, n, w;
+    ngx_uint_t                       i, j, n, w, t;
     ngx_stream_upstream_server_t    *server;
     ngx_stream_upstream_rr_peer_t   *peer, **peerp;
     ngx_stream_upstream_rr_peers_t  *peers, *backup;
@@ -44,6 +50,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
 
         n = 0;
         w = 0;
+        t = 0;
 
         for (i = 0; i < us->servers->nelts; i++) {
             if (server[i].backup) {
@@ -52,6 +59,10 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
 
             n += server[i].naddrs;
             w += server[i].naddrs * server[i].weight;
+
+            if (!server[i].down) {
+                t += server[i].naddrs;
+            }
         }
 
         if (n == 0) {
@@ -75,6 +86,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
         peers->number = n;
         peers->weighted = (w != n);
         peers->total_weight = w;
+        peers->tries = t;
         peers->name = &us->host;
 
         n = 0;
@@ -92,6 +104,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
                 peer[n].weight = server[i].weight;
                 peer[n].effective_weight = server[i].weight;
                 peer[n].current_weight = 0;
+                peer[n].max_conns = server[i].max_conns;
                 peer[n].max_fails = server[i].max_fails;
                 peer[n].fail_timeout = server[i].fail_timeout;
                 peer[n].down = server[i].down;
@@ -109,6 +122,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
 
         n = 0;
         w = 0;
+        t = 0;
 
         for (i = 0; i < us->servers->nelts; i++) {
             if (!server[i].backup) {
@@ -117,6 +131,10 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
 
             n += server[i].naddrs;
             w += server[i].naddrs * server[i].weight;
+
+            if (!server[i].down) {
+                t += server[i].naddrs;
+            }
         }
 
         if (n == 0) {
@@ -138,6 +156,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
         backup->number = n;
         backup->weighted = (w != n);
         backup->total_weight = w;
+        backup->tries = t;
         backup->name = &us->host;
 
         n = 0;
@@ -155,6 +174,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
                 peer[n].weight = server[i].weight;
                 peer[n].effective_weight = server[i].weight;
                 peer[n].current_weight = 0;
+                peer[n].max_conns = server[i].max_conns;
                 peer[n].max_fails = server[i].max_fails;
                 peer[n].fail_timeout = server[i].fail_timeout;
                 peer[n].down = server[i].down;
@@ -212,6 +232,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
     peers->number = n;
     peers->weighted = 0;
     peers->total_weight = n;
+    peers->tries = n;
     peers->name = &us->host;
 
     peerp = &peers->peer;
@@ -223,6 +244,7 @@ ngx_stream_upstream_init_round_robin(ngx_conf_t *cf,
         peer[i].weight = 1;
         peer[i].effective_weight = 1;
         peer[i].current_weight = 0;
+        peer[i].max_conns = 0;
         peer[i].max_fails = 1;
         peer[i].fail_timeout = 10;
         *peerp = &peer[i];
@@ -258,6 +280,7 @@ ngx_stream_upstream_init_round_robin_peer(ngx_stream_session_t *s,
 
     rrp->peers = us->peer.data;
     rrp->current = NULL;
+    rrp->config = 0;
 
     n = rrp->peers->number;
 
@@ -280,12 +303,134 @@ ngx_stream_upstream_init_round_robin_peer(ngx_stream_session_t *s,
 
     s->upstream->peer.get = ngx_stream_upstream_get_round_robin_peer;
     s->upstream->peer.free = ngx_stream_upstream_free_round_robin_peer;
+    s->upstream->peer.notify = ngx_stream_upstream_notify_round_robin_peer;
     s->upstream->peer.tries = ngx_stream_upstream_tries(rrp->peers);
 #if (NGX_STREAM_SSL)
     s->upstream->peer.set_session =
                              ngx_stream_upstream_set_round_robin_peer_session;
     s->upstream->peer.save_session =
                              ngx_stream_upstream_save_round_robin_peer_session;
+#endif
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_stream_upstream_create_round_robin_peer(ngx_stream_session_t *s,
+    ngx_stream_upstream_resolved_t *ur)
+{
+    u_char                              *p;
+    size_t                               len;
+    socklen_t                            socklen;
+    ngx_uint_t                           i, n;
+    struct sockaddr                     *sockaddr;
+    ngx_stream_upstream_rr_peer_t       *peer, **peerp;
+    ngx_stream_upstream_rr_peers_t      *peers;
+    ngx_stream_upstream_rr_peer_data_t  *rrp;
+
+    rrp = s->upstream->peer.data;
+
+    if (rrp == NULL) {
+        rrp = ngx_palloc(s->connection->pool,
+                         sizeof(ngx_stream_upstream_rr_peer_data_t));
+        if (rrp == NULL) {
+            return NGX_ERROR;
+        }
+
+        s->upstream->peer.data = rrp;
+    }
+
+    peers = ngx_pcalloc(s->connection->pool,
+                        sizeof(ngx_stream_upstream_rr_peers_t));
+    if (peers == NULL) {
+        return NGX_ERROR;
+    }
+
+    peer = ngx_pcalloc(s->connection->pool,
+                       sizeof(ngx_stream_upstream_rr_peer_t) * ur->naddrs);
+    if (peer == NULL) {
+        return NGX_ERROR;
+    }
+
+    peers->single = (ur->naddrs == 1);
+    peers->number = ur->naddrs;
+    peers->tries = ur->naddrs;
+    peers->name = &ur->host;
+
+    if (ur->sockaddr) {
+        peer[0].sockaddr = ur->sockaddr;
+        peer[0].socklen = ur->socklen;
+        peer[0].name = ur->name;
+        peer[0].weight = 1;
+        peer[0].effective_weight = 1;
+        peer[0].current_weight = 0;
+        peer[0].max_conns = 0;
+        peer[0].max_fails = 1;
+        peer[0].fail_timeout = 10;
+        peers->peer = peer;
+
+    } else {
+        peerp = &peers->peer;
+
+        for (i = 0; i < ur->naddrs; i++) {
+
+            socklen = ur->addrs[i].socklen;
+
+            sockaddr = ngx_palloc(s->connection->pool, socklen);
+            if (sockaddr == NULL) {
+                return NGX_ERROR;
+            }
+
+            ngx_memcpy(sockaddr, ur->addrs[i].sockaddr, socklen);
+            ngx_inet_set_port(sockaddr, ur->port);
+
+            p = ngx_pnalloc(s->connection->pool, NGX_SOCKADDR_STRLEN);
+            if (p == NULL) {
+                return NGX_ERROR;
+            }
+
+            len = ngx_sock_ntop(sockaddr, socklen, p, NGX_SOCKADDR_STRLEN, 1);
+
+            peer[i].sockaddr = sockaddr;
+            peer[i].socklen = socklen;
+            peer[i].name.len = len;
+            peer[i].name.data = p;
+            peer[i].weight = 1;
+            peer[i].effective_weight = 1;
+            peer[i].current_weight = 0;
+            peer[i].max_conns = 0;
+            peer[i].max_fails = 1;
+            peer[i].fail_timeout = 10;
+            *peerp = &peer[i];
+            peerp = &peer[i].next;
+        }
+    }
+
+    rrp->peers = peers;
+    rrp->current = NULL;
+    rrp->config = 0;
+
+    if (rrp->peers->number <= 8 * sizeof(uintptr_t)) {
+        rrp->tried = &rrp->data;
+        rrp->data = 0;
+
+    } else {
+        n = (rrp->peers->number + (8 * sizeof(uintptr_t) - 1))
+                / (8 * sizeof(uintptr_t));
+
+        rrp->tried = ngx_pcalloc(s->connection->pool, n * sizeof(uintptr_t));
+        if (rrp->tried == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    s->upstream->peer.get = ngx_stream_upstream_get_round_robin_peer;
+    s->upstream->peer.free = ngx_stream_upstream_free_round_robin_peer;
+    s->upstream->peer.tries = ngx_stream_upstream_tries(rrp->peers);
+#if (NGX_STREAM_SSL)
+    s->upstream->peer.set_session = ngx_stream_upstream_empty_set_session;
+    s->upstream->peer.save_session = ngx_stream_upstream_empty_save_session;
 #endif
 
     return NGX_OK;
@@ -314,6 +459,10 @@ ngx_stream_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
         peer = peers->peer;
 
         if (peer->down) {
+            goto failed;
+        }
+
+        if (peer->max_conns && peer->conns >= peer->max_conns) {
             goto failed;
         }
 
@@ -356,7 +505,7 @@ failed:
                 / (8 * sizeof(uintptr_t));
 
         for (i = 0; i < n; i++) {
-             rrp->tried[i] = 0;
+            rrp->tried[i] = 0;
         }
 
         ngx_stream_upstream_rr_peers_unlock(peers);
@@ -368,12 +517,6 @@ failed:
         }
 
         ngx_stream_upstream_rr_peers_wlock(peers);
-    }
-
-    /* all peers failed, mark them as live for quick recovery */
-
-    for (peer = peers->peer; peer; peer = peer->next) {
-        peer->fails = 0;
     }
 
     ngx_stream_upstream_rr_peers_unlock(peers);
@@ -406,7 +549,6 @@ ngx_stream_upstream_get_peer(ngx_stream_upstream_rr_peer_data_t *rrp)
          peer;
          peer = peer->next, i++)
     {
-
         n = i / (8 * sizeof(uintptr_t));
         m = (uintptr_t) 1 << i % (8 * sizeof(uintptr_t));
 
@@ -422,6 +564,10 @@ ngx_stream_upstream_get_peer(ngx_stream_upstream_rr_peer_data_t *rrp)
             && peer->fails >= peer->max_fails
             && now - peer->checked <= peer->fail_timeout)
         {
+            continue;
+        }
+
+        if (peer->max_conns && peer->conns >= peer->max_conns) {
             continue;
         }
 
@@ -530,6 +676,32 @@ ngx_stream_upstream_free_round_robin_peer(ngx_peer_connection_t *pc, void *data,
 }
 
 
+static void
+ngx_stream_upstream_notify_round_robin_peer(ngx_peer_connection_t *pc,
+    void *data, ngx_uint_t type)
+{
+    ngx_stream_upstream_rr_peer_data_t  *rrp = data;
+
+    ngx_stream_upstream_rr_peer_t  *peer;
+
+    peer = rrp->current;
+
+    if (type == NGX_STREAM_UPSTREAM_NOTIFY_CONNECT
+        && pc->connection->type == SOCK_STREAM)
+    {
+        ngx_stream_upstream_rr_peers_rlock(rrp->peers);
+        ngx_stream_upstream_rr_peer_lock(rrp->peers, peer);
+
+        if (peer->accessed < peer->checked) {
+            peer->fails = 0;
+        }
+
+        ngx_stream_upstream_rr_peer_unlock(rrp->peers, peer);
+        ngx_stream_upstream_rr_peers_unlock(rrp->peers);
+    }
+}
+
+
 #if (NGX_STREAM_SSL)
 
 static ngx_int_t
@@ -543,10 +715,7 @@ ngx_stream_upstream_set_round_robin_peer_session(ngx_peer_connection_t *pc,
     ngx_stream_upstream_rr_peer_t   *peer;
 #if (NGX_STREAM_UPSTREAM_ZONE)
     int                              len;
-#if OPENSSL_VERSION_NUMBER >= 0x0090707fL
-    const
-#endif
-    u_char                          *p;
+    const u_char                    *p;
     ngx_stream_upstream_rr_peers_t  *peers;
     u_char                           buf[NGX_SSL_MAX_SESSION_SIZE];
 #endif
@@ -618,7 +787,7 @@ ngx_stream_upstream_save_round_robin_peer_session(ngx_peer_connection_t *pc,
 
     if (peers->shpool) {
 
-        ssl_session = SSL_get0_session(pc->connection->ssl->connection);
+        ssl_session = ngx_ssl_get0_session(pc->connection);
 
         if (ssl_session == NULL) {
             return;
@@ -697,6 +866,20 @@ ngx_stream_upstream_save_round_robin_peer_session(ngx_peer_connection_t *pc,
 
         ngx_ssl_free_session(old_ssl_session);
     }
+}
+
+
+static ngx_int_t
+ngx_stream_upstream_empty_set_session(ngx_peer_connection_t *pc, void *data)
+{
+    return NGX_OK;
+}
+
+
+static void
+ngx_stream_upstream_empty_save_session(ngx_peer_connection_t *pc, void *data)
+{
+    return;
 }
 
 #endif
